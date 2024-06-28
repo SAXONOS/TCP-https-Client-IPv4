@@ -1,0 +1,151 @@
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// Function to extract the redirection URL from the response
+char* get_redirect_url(const char* response) {
+    const char* location_header = "Location: ";
+    char* location_start = strstr(response, location_header);
+    if (location_start) {
+        location_start += strlen(location_header);
+        char* location_end = strstr(location_start, "\r\n");
+        if (location_end) {
+            size_t len = location_end - location_start;
+            char* redirect_url = (char*)malloc(len + 1);
+            if (redirect_url) {
+                strncpy(redirect_url, location_start, len);
+                redirect_url[len] = '\0';
+                return redirect_url;
+            }
+        }
+    }
+    return NULL;
+}
+
+// Function to create and send an HTTPS request
+void send_https_request(const char* hostname, const char* request) {
+    // Initialize SSL library
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+
+    // Resolve the hostname to an IP address
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, "443", &hints, &res) != 0) {
+        perror("getaddrinfo failed");
+        return;
+    }
+
+    // Create a TCP socket
+    int sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sockfd < 0) {
+        perror("Socket creation failed");
+        freeaddrinfo(res);
+        return;
+    }
+
+    // Connect to the server
+    if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
+        perror("Connection failed");
+        close(sockfd);
+        freeaddrinfo(res);
+        return;
+    }
+
+    freeaddrinfo(res);
+
+    // Create SSL context
+    SSL_CTX* ctx = SSL_CTX_new(TLS_method());
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        close(sockfd);
+        return;
+    }
+
+    // Create an SSL structure
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        close(sockfd);
+        return;
+    }
+
+    // Associate the socket with the SSL structure
+    SSL_set_fd(ssl, sockfd);
+
+    // Establish an SSL connection
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        close(sockfd);
+        return;
+    }
+
+    // Send the HTTP request
+    if (SSL_write(ssl, request, strlen(request)) <= 0) {
+        ERR_print_errors_fp(stderr);
+    } else {
+        // Read the response
+        char buffer[4096] = {0};
+        int bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+        if (bytes > 0) {
+            buffer[bytes] = 0;
+            printf("Response:\n%s\n", buffer);
+
+            // Check for redirection
+            if (strstr(buffer, "HTTP/1.1 302 Found") != NULL) {
+                char* redirect_url = get_redirect_url(buffer);
+                if (redirect_url) {
+                    printf("Redirect URL: %s\n", redirect_url);
+                    // Cleanup current connection
+                    SSL_shutdown(ssl);
+                    SSL_free(ssl);
+                    SSL_CTX_free(ctx);
+                    close(sockfd);
+
+                    // Extract hostname from redirect URL
+                    char new_hostname[256];
+                    sscanf(redirect_url, "https://%255[^/]/", new_hostname);
+
+                    // Create new request string
+                    char new_request[512];
+                    snprintf(new_request, sizeof(new_request), "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", new_hostname);
+
+                    // Free the redirect URL and send a new request
+                    free(redirect_url);
+                    send_https_request(new_hostname, new_request);
+                    return;
+                }
+            }
+        } else {
+            ERR_print_errors_fp(stderr);
+        }
+    }
+
+    // Cleanup
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(sockfd);
+}
+
+int main() {
+    // Initial request
+    const char* hostname = "8.8.8.8";
+    const char* request = "GET / HTTP/1.1\r\nHost: 8.8.8.8\r\n\r\n";
+    send_https_request(hostname, request);
+    return 0;
+}
